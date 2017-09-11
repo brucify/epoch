@@ -1,6 +1,9 @@
 %%%-------------------------------------------------------------------
 %%% @copyright (C) 2017, Aeternity Anstalt
-%%% @doc Service holding the chain of block headers and blocks.
+%%% @doc Service holding the longest chain of block headers and blocks.
+%%%
+%%% The longest chain is determined according to the amount of work
+%%% done on the chain.
 %%%
 %%% @TODO Unit testing of unhappy paths.
 %%% @TODO Forced chain (fork).
@@ -22,7 +25,9 @@
          get_header_by_height/1,
          get_block_by_height/1,
          insert_header/1,
-         write_block/1]).
+         write_block/1,
+         get_work_by_hash_and_at_top/1,
+         has_more_work/1]).
 %% TODO `force_insert_headers`: Insert the specified sequence of headers in the chain, potentially changing the top header in the chain.
 
 %% gen_server callbacks
@@ -44,6 +49,8 @@
 -record(state, {top :: #top_state{},
                 headers_db :: headers_db(),
                 blocks_db :: blocks_db()}).
+
+-type work() :: term(). %% TODO: Move to PoW-related module.
 
 -type top_header_db() :: dict:dict(
                            ?TOP_HEADER, %% Only one key.
@@ -127,6 +134,50 @@ insert_header(Header) ->
 write_block(Block) ->
     gen_server:call(?SERVER, {write_block, Block},
                     ?DEFAULT_CALL_TIMEOUT).
+
+-spec get_work_by_hash_and_at_top(block_header_hash()) ->
+                                         do_get_work_by_hash_and_at_top_reply().
+get_work_by_hash_and_at_top(HeaderHash) ->
+    gen_server:call(?SERVER, {get_work_by_hash_and_at_top, HeaderHash},
+                    ?DEFAULT_CALL_TIMEOUT).
+
+-spec has_more_work([header(), ...]) -> %% First element has lowest height.
+                           {ok, {boolean(), {top_header, header()}}} |
+                           {error, Reason} when
+      Reason :: {no_common_ancestor, {top_header, header()}}
+              | {different_genesis, {genesis_header, header()}}.
+has_more_work(HeaderChain) ->
+    %% TODO?: Check that chain is chain i.e. check fields height and
+    %% previous hash in each header in relation to the previous
+    %% header.
+    [LowerHeader | _] = HeaderChain,
+    case aec_headers:height(LowerHeader) of
+        ?GENESIS_HEIGHT ->
+            %% The specified chain is a chain complete from genesis.
+            %% Check that the genesis is the expected one.
+            {ok, GenesisHeader} = get_header_by_height(0),
+            if
+                LowerHeader =/= GenesisHeader ->
+                    {error, {different_genesis, {genesis_header,
+                                                 GenesisHeader}}};
+                true ->
+                    todo
+            end;
+        LowerHeaderHeight when is_integer(LowerHeaderHeight),
+                               LowerHeaderHeight > ?GENESIS_HEIGHT ->
+            %% The specified chain does not start from genesis.
+            %% Attempt to retrieve work of higher missing ancestor and
+            %% work of top, so to compare work of top against work of
+            %% specified chain.
+            LowerHeaderPreviousHash = aec_headers:prev_hash(LowerHeader),
+            case get_work_by_hash_and_at_top(LowerHeaderPreviousHash) of
+                {error, {header_not_found, {top_header, TopHeader}}} ->
+                    {error, {no_common_ancestor, {top_header, TopHeader}}};
+                {ok, {{work_at_hash, Work}, {top_header, TopHeader}}} ->
+                    Work, %% TODO Compute work of specified chain.
+                    {ok, {todo, {top_header, TopHeader}}}
+            end
+    end.
 
 %%%===================================================================
 %%% gen_server callbacks
@@ -228,6 +279,13 @@ handle_call({write_block, Block}, _From, State) ->
                   blocks_db = NewBlocksDb},
             {reply, Reply, NewState}
     end;
+handle_call({get_work_by_hash_and_at_top,
+             HeaderHash = <<_:?BLOCK_HEADER_HASH_BYTES/unit:8>>},
+            _From, State) ->
+    Reply = do_get_work_by_hash_and_at_top(HeaderHash,
+                                           State#state.top#top_state.top_header,
+                                           State#state.headers_db),
+    {reply, Reply, State};
 handle_call(Request, From, State) ->
     lager:warning("Ignoring unknown call request from ~p: ~p", [From, Request]),
     {noreply, State}.
@@ -573,4 +631,18 @@ do_find_header_hash_in_chain_1(HeaderHashToFind, HeaderHash, HeadersDb) ->
         Height when is_integer(Height), Height > ?GENESIS_HEIGHT ->
             do_find_header_hash_in_chain_1(
               HeaderHashToFind, aec_headers:prev_hash(Header), HeadersDb)
+    end.
+
+-type do_get_work_by_hash_and_at_top_reply() ::
+        {ok, {{work_at_hash, work()},
+              {top_header, header()}}} |
+        {error, Reason::{header_not_found, {top_header, header()}}}.
+-spec do_get_work_by_hash_and_at_top(block_header_hash(), header(), headers_db()
+                                    ) -> do_get_work_by_hash_and_at_top_reply().
+do_get_work_by_hash_and_at_top(HeaderHash, TopHeader, HeadersDb) ->
+    case headers_db_get(HeadersDb, HeaderHash) of
+        %% TODO {ok, #chain_header{work = Work}} ->
+        %% TODO     {ok, {{work_at_hash, Work}, {top_header, TopHeader}}};
+        {error, not_found} ->
+            {error, {header_not_found, {top_header, TopHeader}}}
     end.
